@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoonBounceEditor</title>
+  <link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+
+  <style>
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: #e2ded0; color: #302b25; font: 15px system-ui, sans-serif; }
+    #open-panel { min-height: 100dvh; display: grid; place-content: center; justify-items: center; gap: 12px; padding: 24px; text-align: center; }
+    h1, p { margin: 0; }
+    button { font: inherit; color: inherit; background: #faf7ee; border: 1px solid #9a8e7c; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    #editor { height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+    #toolbar { display: flex; align-items: center; gap: 12px; padding: 6px 12px; background: #eeeae0; }
+    #library-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #save { flex: none; }
+    #save-status { min-width: 0; overflow-wrap: anywhere; }
+    #save-status[data-error="true"] { color: #8d2e22; }
+    #canvas-container { min-width: 0; min-height: 0; }
+    #canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+  </style>
+</head>
+<body>
+  <main id="open-panel">
+    <h1>Moon Bounce Editor</h1>
+    <button id="open" type="button">打开本地文稿库</button>
+    <p id="open-status" role="status">选择文稿库根目录，或选择一个空目录新建文稿库。</p>
+  </main>
+  <div id="editor" hidden>
+    <div id="toolbar">
+      <button id="save" type="button">保存到本地</button>
+      <span id="library-name"></span>
+      <span id="save-status" role="status"></span>
+    </div>
+    <div id="canvas-container"><canvas id="canvas" tabindex="0"></canvas></div>
+  </div>
+  <script src="index.js"></script>
+  <script>
+  "use strict";
+
+  const MEMORY_ROOT = "/moonbounce-library";
+  const JOURNAL_DIRECTORY = ".moonbounce-web-save";
+  const JOURNAL_FILE = "pending.json";
+  const LIBRARY_LOCK = "moonbounce-local-library-write";
+  const ROOT_FILES = new Set([
+    "editor_library.json", "editor_library.json.last_good",
+    "stamp_presets.json", "stamp_presets.json.last_good",
+  ]);
+
+  function segments(path) {
+    const parts = path.split("/");
+    if (parts.some(part => !part || part === "." || part === ".." || part.includes("\\"))) {
+      throw new Error("文稿库包含无效的文件路径。");
+    }
+    return parts;
+  }
+
+  // Publication order follows the desktop format: payloads, scene manifests,
+  // project indexes, then workspace state. Only these files belong to the bridge.
+  function fileOrder(path) {
+    if (ROOT_FILES.has(path)) return path.endsWith(".last_good") ? 4 : 5;
+    const [root, project, group, scene, name, filename, ...rest] = segments(path);
+    if (root !== "editor_projects" || !project || project.startsWith(".") || rest.length) return null;
+    if (project === "shared_layer_contents") {
+      if (!scene && group?.endsWith(".json")) return 0;
+      return !name && group === "transactions" && scene?.endsWith(".json") ? 0 : null;
+    }
+    if (!scene && group === "project.json") return 3;
+    if (group !== "editable_scenes" || !scene || scene.startsWith(".")) return null;
+    if (!filename && name === "scene.json") return 2;
+    if (!filename && name === "scene.json.invalid_backup") return 1;
+    return name === "layers" && filename?.endsWith(".png") && !filename.startsWith(".") ? 0 : null;
+  }
+
+  function managedDirectory(path) {
+    const [root, project, group, scene, kind, ...rest] = segments(path);
+    if (root !== "editor_projects" || rest.length || project?.startsWith(".")) return false;
+    if (project === "shared_layer_contents") return !group || (group === "transactions" && !scene);
+    if (!group) return true;
+    return group === "editable_scenes" && !scene?.startsWith(".") && (!kind || kind === "layers");
+  }
+
+  async function* libraryFiles(directory, prefix = "") {
+    for await (const [name, handle] of directory.entries()) {
+      const path = prefix + name;
+      if (handle.kind === "directory" && managedDirectory(path)) {
+        yield* libraryFiles(handle, path + "/");
+      } else if (handle.kind === "file" && fileOrder(path) !== null) {
+        yield [path, handle];
+      }
+    }
+  }
+
+  async function optional(operation) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error.name === "NotFoundError") return null;
+      throw error;
+    }
+  }
+
+  async function parentDirectory(root, path, create) {
+    const parts = segments(path);
+    const name = parts.pop();
+    let directory = root;
+    for (const part of parts) {
+      directory = await optional(() => directory.getDirectoryHandle(part, { create }));
+      if (!directory) break;
+    }
+    return { directory, name };
+  }
+
+  async function readFile(root, path) {
+    const { directory, name } = await parentDirectory(root, path, false);
+    const handle = directory && await optional(() => directory.getFileHandle(name));
+    return handle ? (await handle.getFile()).arrayBuffer() : null;
+  }
+
+  async function writeFile(root, path, bytes) {
+    const { directory, name } = await parentDirectory(root, path, true);
+    const handle = await directory.getFileHandle(name, { create: true });
+    const stream = await handle.createWritable();
+    try {
+      await stream.write(bytes);
+      await stream.close();
+    } catch (error) {
+      await stream.abort().catch(() => {});
+      throw error;
+    }
+  }
+
+  async function removeFile(root, path) {
+    const { directory, name } = await parentDirectory(root, path, false);
+    if (directory) {
+      const handle = await optional(() => directory.getFileHandle(name));
+      if (handle) await optional(() => directory.removeEntry(name));
+    }
+  }
+
+  async function sha256(bytes) {
+    if (bytes === null) return null;
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  const isDigest = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  const emptyDigest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+  async function clearJournal(root, journal) {
+    // Removing the marker is the commit point. Backups can be removed afterwards.
+    await removeFile(journal, JOURNAL_FILE);
+    await root.removeEntry(JOURNAL_DIRECTORY, { recursive: true }).catch(() => {});
+  }
+
+  async function recoverLibrary(root) {
+    const journal = await optional(() => root.getDirectoryHandle(JOURNAL_DIRECTORY));
+    if (!journal) return;
+    const marker = await readFile(journal, JOURNAL_FILE);
+    if (!marker?.byteLength) {
+      await clearJournal(root, journal);
+      return;
+    }
+    const plan = JSON.parse(new TextDecoder().decode(marker));
+    if (plan.version !== 1 || !Array.isArray(plan.entries)) throw new Error("无法读取上次保存的恢复记录。");
+    const seen = new Set();
+    const restore = [];
+    for (const [index, entry] of plan.entries.entries()) {
+      const { path, before, after } = entry;
+      if (typeof path !== "string" || fileOrder(path) === null || seen.has(path) ||
+          ![before, after].every(hash => hash === null || isDigest(hash)) || before === after) {
+        throw new Error("无法验证上次保存的恢复记录。");
+      }
+      seen.add(path);
+      const current = await sha256(await readFile(root, path));
+      // A newly created file handle may leave an empty file if the write never closed.
+      if (current === before) continue;
+      if (current !== after && !((before === null || after === null) && current === emptyDigest)) {
+        throw new Error(`文稿与恢复记录不一致，未覆盖 ${path}。`);
+      }
+      const bytes = before === null ? null : await readFile(journal, `${index}.backup`);
+      if (await sha256(bytes) !== before) throw new Error(`无法验证 ${path} 的恢复副本。`);
+      restore.push({ path, bytes });
+    }
+    for (const { path, bytes } of restore.reverse()) {
+      if (bytes === null) await removeFile(root, path);
+      else await writeFile(root, path, bytes);
+    }
+    await clearJournal(root, journal);
+  }
+
+  async function validateChoice(root) {
+    let hasOtherEntries = false;
+    for await (const [name, handle] of root.entries()) {
+      if ((name === "editor_projects" && handle.kind === "directory") ||
+          (ROOT_FILES.has(name) && handle.kind === "file")) return;
+      if (!name.startsWith(".")) hasOtherEntries = true;
+    }
+    if (hasOtherEntries) throw new Error("请选择文稿库根目录（包含 editor_projects 或 editor_library.json），或一个空目录。");
+  }
+
+  async function confirmDiskSnapshot(root, baseline) {
+    const seen = new Set();
+    for await (const [path, handle] of libraryFiles(root)) {
+      const hash = await sha256(await (await handle.getFile()).arrayBuffer());
+      if (baseline.get(path) !== hash) throw new Error(`本地文件已被其他程序修改，无法覆盖 ${path}。`);
+      seen.add(path);
+    }
+    for (const path of baseline.keys()) {
+      if (!seen.has(path)) throw new Error(`本地文件已被移除，无法保存 ${path}。`);
+    }
+  }
+
+  async function publishLibrary(root, baseline, snapshot, readMemory) {
+    await recoverLibrary(root);
+    await confirmDiskSnapshot(root, baseline);
+    const writes = [];
+    const deletes = [];
+    for (const [path, after] of snapshot) {
+      const before = baseline.get(path) ?? null;
+      if (before !== after) writes.push({ path, before, after });
+    }
+    for (const [path, before] of baseline) {
+      if (!snapshot.has(path)) deletes.push({ path, before, after: null });
+    }
+    writes.sort((a, b) => fileOrder(a.path) - fileOrder(b.path));
+    deletes.sort((a, b) => fileOrder(b.path) - fileOrder(a.path));
+    const entries = [...writes, ...deletes];
+    if (!entries.length) return;
+
+    const journal = await root.getDirectoryHandle(JOURNAL_DIRECTORY, { create: true });
+    try {
+      for (const [index, { path, before }] of entries.entries()) {
+        const bytes = await readFile(root, path);
+        if (await sha256(bytes) !== before) throw new Error(`本地文件已被其他程序修改，无法覆盖 ${path}。`);
+        if (before !== null) await writeFile(journal, `${index}.backup`, bytes);
+      }
+      const marker = new TextEncoder().encode(JSON.stringify({ version: 1, entries }));
+      await writeFile(journal, JOURNAL_FILE, marker);
+
+      for (const { path, before, after } of entries) {
+        let bytes = null;
+        if (after !== null) {
+          const encoded = await readMemory(path);
+          if (typeof encoded !== "string") throw new Error(`无法读取编辑中的文件 ${path}。`);
+          bytes = Uint8Array.fromBase64 ? Uint8Array.fromBase64(encoded) : Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+          if (await sha256(bytes) !== after) throw new Error(`保存时文件发生变化，请重试 ${path}。`);
+        }
+        if (await sha256(await readFile(root, path)) !== before) {
+          throw new Error(`本地文件已被其他程序修改，无法覆盖 ${path}。`);
+        }
+        if (after === null) await removeFile(root, path);
+        else await writeFile(root, path, bytes);
+      }
+      await clearJournal(root, journal);
+    } catch (error) {
+      try {
+        await recoverLibrary(root);
+      } catch (recoveryError) {
+        throw new Error(`本地保存未完成，恢复记录已保留。${errorMessage(recoveryError)}`);
+      }
+      throw error;
+    }
+  }
+
+  function errorMessage(error) {
+    if (error.name === "NotAllowedError" || error.name === "SecurityError") {
+      return "无法访问本地目录。请使用「保存到本地」重新授权，或重新选择目录。";
+    }
+    return error.message || "本地文稿操作未完成，请重试。";
+  }
+
+  const openPanel = document.getElementById("open-panel");
+  const openButton = document.getElementById("open");
+  const openStatus = document.getElementById("open-status");
+  const editor = document.getElementById("editor");
+  const canvas = document.getElementById("canvas");
+  const canvasContainer = document.getElementById("canvas-container");
+  const saveButton = document.getElementById("save");
+  const saveStatus = document.getElementById("save-status");
+  const libraryName = document.getElementById("library-name");
+  const canvasResizeDelayMs = 150;
+
+  let directory = null;
+  let baseline = new Map();
+  let requestSave = null;
+  let provideFile = null;
+  let writing = false;
+  let canvasResizeTimer;
+
+  function resizeCanvas() {
+    if (editor.hidden) return;
+    const width = Math.max(1, Math.floor(canvasContainer.clientWidth * devicePixelRatio));
+    const height = Math.max(1, Math.floor(canvasContainer.clientHeight * devicePixelRatio));
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+  }
+
+  function reportSave(saved, message) {
+    saveStatus.dataset.error = String(!saved);
+    saveStatus.textContent = saved ? "已保存到本地" : message;
+  }
+
+  window.moonBounceWebInput = {
+    captureTrackpad(pinch, pan) {
+      let lastPanTime = -Infinity;
+      function hasWheelNotches(delta, legacyDelta) {
+        if (delta === 0) return true;
+        if (!legacyDelta) return false;
+        // Chromium exposes legacy wheel ticks in units of 120, sometimes divided by DPR.
+        const ticks = Math.abs(legacyDelta);
+        const unscaledTicks = ticks * devicePixelRatio;
+        const nearestNotch = Math.round(unscaledTicks / 120) * 120;
+        return ticks % 120 === 0 ||
+          (nearestNotch > 0 && Math.abs(unscaledTicks - nearestNotch) < devicePixelRatio);
+      }
+
+      canvas.addEventListener("wheel", event => {
+        if (event.deltaMode !== WheelEvent.DOM_DELTA_PIXEL) return;
+        const { deltaX, deltaY } = event;
+        if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY) || (!deltaX && !deltaY)) return;
+        const bounds = canvas.getBoundingClientRect();
+        if (!bounds.width || !bounds.height) return;
+        const x = (event.clientX - bounds.left) * canvas.width / bounds.width;
+        const y = (event.clientY - bounds.top) * canvas.height / bounds.height;
+        if (event.ctrlKey) {
+          if (deltaY === 0) return;
+          // Chromium encodes a touchpad pinch as deltaY = -100 * log(scale).
+          const factor = Math.exp(-deltaY / 100);
+          if (!Number.isFinite(factor) || factor <= 0) return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          pinch(x, y, factor);
+          return;
+        }
+
+        // A continuous gesture can briefly land on a whole wheel tick, too.
+        const continuingPan = event.timeStamp - lastPanTime < 150 || event.momentum === true;
+        if (!continuingPan && hasWheelNotches(deltaX, event.wheelDeltaX) &&
+            hasWheelNotches(deltaY, event.wheelDeltaY)) return;
+        lastPanTime = event.timeStamp;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        pan(x, y, deltaX, deltaY, event.altKey, event.shiftKey, event.metaKey);
+      }, { capture: true, passive: false });
+    },
+  };
+
+  window.moonBounceLocalLibrary = {
+    isOpen: () => directory !== null,
+    directoryName: () => directory.name,
+    failOpen: message => { openStatus.textContent = message; },
+    attach(callback) {
+      requestSave = callback;
+      libraryName.textContent = directory.name;
+      openPanel.hidden = true;
+      editor.hidden = false;
+      resizeCanvas();
+    },
+    reportSave,
+    provideFile(bytes) {
+      const resolve = provideFile;
+      provideFile = null;
+      if (resolve) resolve(bytes);
+    },
+    async save(encodedHashes, requestFile, finished) {
+      if (writing) {
+        finished(false, "正在保存，请稍候。");
+        return;
+      }
+      writing = true;
+      saveButton.disabled = true;
+      saveStatus.dataset.error = "false";
+      saveStatus.textContent = "正在保存…";
+      let saved = false;
+      let message = "";
+      try {
+        const snapshot = new Map();
+        for (const [path, hash] of Object.entries(JSON.parse(encodedHashes))) {
+          if (fileOrder(path) === null) continue;
+          if (!isDigest(hash)) throw new Error(`无法读取编辑中的文件 ${path}。`);
+          snapshot.set(path, hash);
+        }
+        const readMemory = path => new Promise(resolve => {
+          provideFile = resolve;
+          requestFile(path);
+        });
+        await navigator.locks.request(LIBRARY_LOCK, () => publishLibrary(directory, baseline, snapshot, readMemory));
+        baseline = snapshot;
+        saved = true;
+      } catch (error) {
+        message = errorMessage(error);
+      } finally {
+        provideFile = null;
+        writing = false;
+        saveButton.disabled = false;
+        finished(saved, message);
+      }
+    },
+  };
+
+  addEventListener("beforeunload", event => {
+    if (!writing) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+
+  saveButton.addEventListener("click", async () => {
+    if (!requestSave || writing) return;
+    try {
+      if (await directory.requestPermission({ mode: "readwrite" }) !== "granted") {
+        reportSave(false, "未授予本地目录的写入权限。");
+        return;
+      }
+      canvas.focus();
+      requestSave();
+    } catch (error) {
+      reportSave(false, errorMessage(error));
+    }
+  });
+
+  new ResizeObserver(() => {
+    if (editor.hidden) return;
+    // Keep displaying the existing WebGL frame while the container is changing size.
+    clearTimeout(canvasResizeTimer);
+    canvasResizeTimer = setTimeout(resizeCanvas, canvasResizeDelayMs);
+  }).observe(canvasContainer);
+
+  const config = { ...{"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":16225312,"index.wasm":39513091},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4}, canvas, canvasResizePolicy: 0, persistentPaths: [], serviceWorker: "" };
+  const missing = Engine.getMissingFeatures({ threads: false });
+  if (typeof window.showDirectoryPicker !== "function" || !navigator.locks) {
+    openButton.disabled = true;
+    openStatus.textContent = "请用桌面 Chrome 或 Edge 在 HTTPS 或 localhost 打开，以访问本地文稿库。";
+  } else if (missing.length) {
+    openButton.disabled = true;
+    openStatus.textContent = missing.join(" ");
+  }
+
+  openButton.addEventListener("click", async () => {
+    openButton.disabled = true;
+    let engineStarted = false;
+    try {
+      const selected = await window.showDirectoryPicker({ mode: "readwrite" });
+      openStatus.textContent = "正在读取本地文稿库…";
+      await navigator.locks.request(LIBRARY_LOCK, async () => {
+        await recoverLibrary(selected);
+        await validateChoice(selected);
+        const engine = new Engine(config);
+        engineStarted = true;
+        await engine.init(config.executable);
+        for await (const [path, handle] of libraryFiles(selected)) {
+          const contents = await (await handle.getFile()).arrayBuffer();
+          baseline.set(path, await sha256(contents));
+          engine.copyToFS(`${MEMORY_ROOT}/${path}`, contents);
+        }
+        directory = selected;
+        await engine.startGame();
+      });
+    } catch (error) {
+      openStatus.textContent = error.name === "AbortError"
+        ? "选择文稿库根目录，或选择一个空目录新建文稿库。"
+        : errorMessage(error);
+      if (!engineStarted) openButton.disabled = false;
+    }
+  });
+  </script>
+</body>
+</html>
+
